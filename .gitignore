@@ -1,3 +1,6 @@
 .git
 
 /IRenv
+
+*/__pycache__/
+*.swap
