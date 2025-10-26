@@ -1,0 +1,3 @@
+2025-10-26 12:37:51,170 - Logging to: /hpc/group/csdept/aho13/labIR/logs/i2t.log
+2025-10-26 12:37:51,170 - Evaluating ['MSCOCO_i2t', 'VisualNews_i2t'] datasets with ['none', 'compress', 'flip', 'gauss1'] perturbations
+2025-10-26 12:37:51,170 - Computing NDCG@10

@@ -1,0 +1,10 @@
+huggingface_hub>=0.34.0
+datasets==4.2.0
+Pillow
+torch==2.6.0
+numpy
+ipykernel
+scikit-learn
+opencv-python
+transformers
+
