@@ -77,7 +77,8 @@ def perturb(img, ptype):
         return flip_img, True
     elif ptype=="compress":
         new_width, new_height = img.size[0] // 5 * 4, img.size[1] //5 *4
-        return image.resize((new_width, new_height)), True
+        return img.resize((new_width, new_height)), True
+
     # base
     else:
         return img, False
@@ -87,14 +88,10 @@ def deliverthegoods(datasets, perturbations):
     ndcg_scores = {}
     avg_ndcg_scores = {}
     base_img_url = '/work/aho13/work/aho13/'
-    log_file = f"{os.getcwd()}/logs/i2t.log"
     k=10
 
     i2t= set(["MSCOCO_i2t","VisualNews_i2t"])
-    logger = setup_ndcg_logger(log_file)
     
-    logger.info(f"Evaluating {(datasets)} datasets with {perturbations} perturbations")
-    logger.info(f"Computing NDCG@{k}")
 
 
     with torch.autocast(device_type='cuda', dtype=torch.float16):
@@ -103,18 +100,19 @@ def deliverthegoods(datasets, perturbations):
             #df = pd.read_csv(base_url+f"{ds_name}/test-00000-of-00001.parquet", encoding="utf-16")
             ds = load_dataset("TIGER-Lab/MMEB-eval", ds_name)
 
+            log_file = f"{os.getcwd()}/logs/{ds_name}.log"
+            logger = setup_ndcg_logger(log_file)
+    
             # determine type of the retrieval 
             if ds_name in i2t:
-                qry_type = 'image'
-                corp_type = 'text'
+                retrieval_type = 'i2t'
             else:
-                qry_type = 'text'
-                corp_type = 'image'
+                retrieval_type = 't2i'
             for p in perturbations:
                 scores=[]
                 perfect_count = 0
                 retrieved_count = 0
-                for row in tqdm(list(ds['test'])[:20]):
+                for row in tqdm(list(ds['test'])):
                     # Load example image
                     # print(ds)
                     imgURL = base_img_url+ row['qry_img_path']
@@ -123,22 +121,16 @@ def deliverthegoods(datasets, perturbations):
                     
                     p_img, ifpert = perturb(image, p)
                     assert (p == "none" and ifpert==False) or ifpert
-
-
                     
                     truth = [1] + [0]*999
-                    results = pipeline.retrieve(
-                      query_text= row["tgt_text"],
+                    results = pipeline.retrieve_i2t(
                       query_img = [p_img],
                       corpus= row['tgt_text'],
-                      query_type=qry_type,
-                      corpus_type=corp_type
                     )
                     # Calculate nDCG
-                    t = [truth[i] for i in results['indices'][0]]
-                    print(results['scores'].shape, len(t), results['scores'])
-                    
-                    score = ndcg_score([t[:10]], results['scores'], k=10)
+                    t = [truth[i] for i in results['indices'][0][:10]]
+                    #print(results['scores'].shape, len(t), results['scores'])
+                    score = ndcg_score([t],[results['scores'][0][:10].tolist()], k=10)
                     if score > 0.0: 
                         retrieved_count +=1
                     if score == 1.0:
@@ -151,14 +143,14 @@ def deliverthegoods(datasets, perturbations):
                 # Log summary
                 if logger:
                     logger.info("="*60)
-                    logger.info(f"NDCG@{k} Results:")
+                    logger.info(f"NDCG@{k} {ds_name} {p} Results:")
                     logger.info(f"  Mean NDCG: {avg_ndcg:.4f}")
                     logger.info(f"  Median NDCG: {np.median(scores):.4f}")
                     logger.info(f"  Std Dev: {np.std(scores):.4f}")
-                    logger.info(f"  Perfect retrievals (rank 1): {perfect_count}/{len(ndcg_scores)} ({100*perfect_count/len(ndcg_scores):.1f}%)")
-                    logger.info(f"  Relevant in top-{k}: {retrieved_count}/{len(ndcg_scores)} ({100*retrieved_count/len(ndcg_scores):.1f}%)")
+                    logger.info(f"  Perfect retrievals (rank 1): {perfect_count}/{len(scores)} ({100*perfect_count/len(scores):.1f}%)")
+                    logger.info(f"  Relevant in top-{k}: {retrieved_count}/{len(scores)} ({100*retrieved_count/len(scores):.1f}%)")
                     logger.info("="*60)
-                print(f"\nAverage nDCG for {ds_name} dataset, {p} : {avg_ndcg:.4f}")
+                #print(f"\nAverage nDCG for {ds_name} dataset, {p} : {avg_ndcg:.4f}")
     pipeline.cleanup()
     return ndcg_scores
 
@@ -166,8 +158,8 @@ def deliverthegoods(datasets, perturbations):
 def main():
 
     # Visual News_i2t dataset and pipeline
-    datasets= ["MSCOCO_i2t","VisualNews_i2t"]
-    perturbations = ["none", "compress","flip", "gauss1"]
+    datasets= ["VisualNews_i2t"]
+    perturbations = ["none", "compress","flip", "gauss1","gauss2","bright","grayscale"]
 
     ndcg_scores = deliverthegoods(datasets, perturbations)
 

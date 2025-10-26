@@ -7,4 +7,4 @@ ipykernel
 scikit-learn
 opencv-python
 transformers
-
+tqdm

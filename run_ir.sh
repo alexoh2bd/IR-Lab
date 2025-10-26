@@ -21,9 +21,10 @@ if [ ! -d "$ENV_NAME" ]; then
 fi
 '''
 # ========== ACTIVATE VENV ==========
+'''
 echo "[INFO] Activating environment..."
 source $ENV_NAME/bin/activate
-
+'''
 # ========== INSTALL DEPENDENCIES ==========
 '''
 echo "[INFO] Installing dependencies..."

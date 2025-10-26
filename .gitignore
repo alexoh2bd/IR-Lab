@@ -3,4 +3,5 @@
 /IRenv
 
 */__pycache__/
+*.pyc
 *.swap

@@ -365,13 +365,9 @@ class MultimodalRetrievalPipeline:
 
         return np.vstack(similarities)
 
-    def retrieve(self,
-                 query_text: Union[List[str], Dict],
+    def retrieve_i2t(self,
                  query_img: List[Image],
-                 corpus: Union[List[str], List[Image.Image], Dict],
-                 top_k: int = 10,
-                 query_type: str = 'text',
-                 corpus_type: str = 'text') -> Dict:
+                 corpus_text: Union[List[str], List[Image.Image], Dict]  ) -> Dict:
         """
         Perform retrieval from queries to corpus.
 
@@ -385,25 +381,28 @@ class MultimodalRetrievalPipeline:
         Returns:
             Dictionary with retrieval results
         """
+
+        top_k = 10
+
         # Encode queries
         # if query_type == 'text':
         # elif query_type == 'image':
-        qry_emb_text = self.encode_texts(query_text)
+        #qry_emb_text = self.encode_texts(query_text)
         qry_emb_img = self.encode_images(query_img)
 
-        print("emb text shape", qry_emb_text.shape)
-        print("emb img shape", qry_emb_img.shape)
+        #print("emb text shape", qry_emb_text.shape)
+        #print("emb img shape", qry_emb_img.shape)
 
         # Encode corpus
-        if corpus_type == 'text':
-            corpus_embeds = self.encode_texts(corpus)
-        elif corpus_type == 'image':
-            corpus_embeds = self.encode_images(corpus)
-        else:
-            raise ValueError(f"Unknown corpus_type: {corpus_type}")
-        # query_embed=  self.compute_similarity(qry_emb_img, qry_emb_text)
+        # if corpus_type == 'text':
+        corpus_embeds = self.encode_texts(corpus_text)
+        #elif corpus_type == 'image':
+        #    corpus_embeds = self.encode_images(corpus)
+        #else:
+        #    raise ValueError(f"Unknown corpus_type: {corpus_type}")
+        similarities=  self.compute_similarity(qry_emb_img, corpus_embeds)
         # Compute similarities
-        similarities = self.compute_similarity(qry_emb_text, corpus_embeds)
+        #similarities = self.compute_similarity(qry_emb_text, corpus_embeds)
 
         # Get top-k results
         top_k = min(top_k, similarities.shape[1])
@@ -413,11 +412,30 @@ class MultimodalRetrievalPipeline:
         results = {
             'indices': top_indices,
             'scores': top_scores,
-            # 'query_embeddings': query_embeds,
-            # 'corpus_embeddings': corpus_embeds
         }
 
         return results
+
+
+    def retrieve_t2i(query_text, corpus_img):
+        
+        query_embed = self.encode_texts(query_text)
+        corpus_embeds = self.encode_images(corpus_imgs)
+        similarities=  self.compute_similarity(qry_embeds, corpus_embeds)
+
+        # Get top-k results
+        top_k = min(top_k, similarities.shape[1])
+        top_indices = np.argsort(-similarities, axis=1)[:, :top_k]
+        top_scores = np.take_along_axis(similarities, top_indices, axis=1)
+
+        results = {
+            'indices': top_indices,
+            'scores': top_scores,
+        }
+
+        return results
+
+
 
     def cleanup(self):
         """Clean up GPU memory."""
