@@ -14,13 +14,14 @@ import pandas as pd
 from sklearn.metrics import ndcg_score
 import cv2
 
-from transformers import CLIPProcessor, CLIPModel, AutoModelForCausalLM
+from transformers import AutoModel, CLIPProcessor, CLIPModel, AutoModelForCausalLM, CLIPTokenizer
 
 # model = AutoModelForCausalLM.from_pretrained("TIGER-Lab/VLM2Vec-Full", trust_remote_code=True, torch_dtype="auto")
 torch.cuda.is_available()
 class Config:
     """Configuration for the retrieval pipeline."""
-    MODEL_NAME = "openai/clip-vit-base-patch32" #"TIGER-Lab/VLM2Vec-Full" #
+    # MODEL_NAME = "openai/clip-vit-base-patch32" #"TIGER-Lab/VLM2Vec-Full" #
+    MODEL_NAME="openai/clip-vit-large-patch14"
     BATCH_SIZE = 256  # Adjust based on your GPU memory
     IMAGE_BATCH_SIZE = 64  # Smaller batch for images (more memory intensive)
     TEXT_BATCH_SIZE = 256  # Larger batch for text-only processing
@@ -30,14 +31,10 @@ class Config:
     NUM_WORKERS = 0  # For DataLoader
     PIN_MEMORY = True
 
-# =============================================================================
-# Custom Dataset Classes
-# =============================================================================
-
-class MMEBImageTextDataset(Dataset):
+class mmebDataset(Dataset):
     """Dataset for image-text pairs from MMEB."""
 
-    def __init__(self, data: List[Dict], processor: CLIPProcessor, mode: str = "query"):
+    def __init__(self, data: List[Dict], mode: str = "query"):
         """
         Args:
             data: List of dicts with 'image' and 'text' keys
@@ -45,61 +42,6 @@ class MMEBImageTextDataset(Dataset):
             mode: 'query' or 'corpus' to handle different data structures
         """
         self.data = data
-        self.processor = processor
-        self.mode = mode
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        item = self.data[idx]
-
-        # Handle image loading
-        if 'image' in item:
-            img = item['image']
-            if isinstance(img, str):
-                # Load from URL or path
-                if img.startswith('http'):
-                    response = requests.get(img, stream=True)
-                    img = Image.open(BytesIO(response.content)).convert('RGB')
-                else:
-                    img = Image.open(img).convert('RGB')
-            elif not isinstance(img, Image.Image):
-                img = Image.fromarray(img).convert('RGB')
-        else:
-            img = None
-
-        # Handle text
-        if 'text' in item:
-            text = item['text']
-            if isinstance(text, list):
-                text = text[0] if text else ""
-            text = text[:Config.MAX_TEXT_LENGTH]
-        elif 'tgt_text' in item:
-            text = item['tgt_text']
-            if isinstance(text, list):
-                text = [t[:Config.MAX_TEXT_LENGTH] for t in text[:1]]
-                text = text[0] if text else ""
-        else:
-            text = ""
-
-        return {'image': img, 'text': text, 'idx': idx}
-# =============================================================================
-# Custom Dataset Classes
-# =============================================================================
-
-class MMEBImageTextDataset(Dataset):
-    """Dataset for image-text pairs from MMEB."""
-
-    def __init__(self, data: List[Dict], processor: CLIPProcessor, mode: str = "query"):
-        """
-        Args:
-            data: List of dicts with 'image' and 'text' keys
-            processor: CLIP processor
-            mode: 'query' or 'corpus' to handle different data structures
-        """
-        self.data = data
-        self.processor = processor
         self.mode = mode
 
     def __len__(self):
@@ -152,9 +94,6 @@ class TextOnlyDataset(Dataset):
     def __getitem__(self, idx):
         return {'text': self.texts[idx], 'idx': idx}
 
-# =============================================================================
-# Custom Collate Functions
-# =============================================================================
 
 def collate_image_text(batch, processor):
     """Collate function for image-text batches."""
@@ -200,10 +139,6 @@ def collate_text_only(batch, processor):
     inputs['indices'] = torch.tensor(indices)
     return inputs
 
-# =============================================================================
-# Retrieval Pipeline
-# =============================================================================
-
 class MultimodalRetrievalPipeline:
     """Efficient multimodal retrieval pipeline for MMEB."""
 
@@ -212,16 +147,20 @@ class MultimodalRetrievalPipeline:
         print(f"Loading model on {Config.DEVICE}...")
 
 
-        if model_name == "openai/clip-vit-base-patch32":
+        # if model_name == "openai/clip-vit-base-patch32":
             # Load model with memory optimizations
-            self.model = CLIPModel.from_pretrained(
-                model_name,
-                dtype=Config.DTYPE
-            ).to(Config.DEVICE)
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained("TIGER-Lab/VLM2Vec-Full", trust_remote_code=True, dtype="auto")
-
+        self.model = CLIPModel.from_pretrained(
+            model_name,
+            dtype=Config.DTYPE
+        ).to(Config.DEVICE)
         self.processor = CLIPProcessor.from_pretrained(model_name)
+
+        # elif model_name == "jinaai/jina-embeddings-v4":
+        #     self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True, torch_dtype="auto")
+        #     self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        # else:
+        #     self.model = AutoModelForCausalLM.from_pretrained("TIGER-Lab/VLM2Vec-Full", trust_remote_code=True, dtype="auto")
+
         self.model.eval()  # Set to evaluation mode
 
         print(f"Model loaded successfully. Using dtype: {Config.DTYPE}")
@@ -238,9 +177,36 @@ class MultimodalRetrievalPipeline:
             numpy array of shape (n_images, embedding_dim)
         """
         if isinstance(images, list):
-            # Create dataset and dataloader
+
+            # Fast path: if batch fits in GPU memory, process directly without DataLoader overhead
+            if len(images) <= Config.IMAGE_BATCH_SIZE:
+                # Process all images in one go
+                inputs = self.processor(
+                    images=images,
+                    return_tensors="pt",
+                    padding=True
+                )
+                
+                # Move to device efficiently with non_blocking for pinned memory
+                inputs = {k: v.to(Config.DEVICE, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                         for k, v in inputs.items()}
+                
+                # Get image embeddings
+                image_embeds = self.model.get_image_features(pixel_values=inputs['pixel_values'])
+                
+                # Normalize embeddings
+                image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
+                
+                result = image_embeds.cpu().numpy()
+                
+                # Clear GPU memory
+                del inputs, image_embeds
+                
+                return result
+            
+            # Larger batch: use DataLoader for memory management
             data = [{'image': img, 'text': ''} for img in images]
-            dataset = MMEBImageTextDataset(data, self.processor)
+            dataset = mmebDataset(data, self.processor)
             dataloader = DataLoader(
                 dataset,
                 batch_size=Config.IMAGE_BATCH_SIZE,
@@ -255,7 +221,7 @@ class MultimodalRetrievalPipeline:
 
         for batch in dataloader:
             # Move to device
-            inputs = {k: v.to(Config.DEVICE) if isinstance(v, torch.Tensor) else v
+            inputs = {k: v.to(Config.DEVICE, non_blocking=True) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items() if k != 'indices'}
 
             # Get image embeddings
@@ -271,7 +237,6 @@ class MultimodalRetrievalPipeline:
 
             # Clear GPU memory
             del inputs, image_embeds
-            torch.cuda.empty_cache()
 
         return np.vstack(embeddings)
 
@@ -287,7 +252,37 @@ class MultimodalRetrievalPipeline:
             numpy array of shape (n_texts, embedding_dim)
         """
         if isinstance(texts, list):
-            # Create dataset and dataloader
+            # Fast path: if batch fits in GPU memory, process directly
+            if len(texts) <= Config.TEXT_BATCH_SIZE:
+                inputs = self.processor(
+                    text=texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=Config.MAX_TEXT_LENGTH
+                )
+                
+                # Move to device efficiently
+                inputs = {k: v.to(Config.DEVICE, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                         for k, v in inputs.items()}
+                
+                # Get text embeddings
+                text_embeds = self.model.get_text_features(
+                    input_ids=inputs['input_ids'],
+                    attention_mask=inputs['attention_mask'],
+                    # token_type_ids=inputs.get('token_type_ids')
+                )
+                
+                # Normalize embeddings
+                text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+                
+                result = text_embeds.cpu().numpy()
+                
+                del inputs, text_embeds
+                
+                return result
+            
+            # Larger batch: use DataLoader
             dataset = TextOnlyDataset(texts, self.processor)
             dataloader = DataLoader(
                 dataset,
@@ -303,7 +298,7 @@ class MultimodalRetrievalPipeline:
 
         for batch in dataloader:
             # Move to device
-            inputs = {k: v.to(Config.DEVICE) if isinstance(v, torch.Tensor) else v
+            inputs = {k: v.to(Config.DEVICE, non_blocking=True) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items() if k != 'indices'}
 
             # Get text embeddings
@@ -319,9 +314,37 @@ class MultimodalRetrievalPipeline:
 
             # Clear GPU memory
             del inputs, text_embeds
-            torch.cuda.empty_cache()
 
         return np.vstack(embeddings)
+
+    @torch.no_grad()
+    def encode_multimodal(self, images: List[Image.Image], texts: List[str]) -> np.ndarray:
+        """
+        Encode image-text pairs into a single fused embedding.
+        
+        Args:
+            images: List of PIL Images
+            texts: List of strings
+            
+        Returns:
+            numpy array of shape (n_pairs, embedding_dim)
+        """
+        if len(images) != len(texts):
+            raise ValueError("Number of images and texts must match")
+            
+        # Encode images and texts separately
+        img_embeds = self.encode_images(images)
+        txt_embeds = self.encode_texts(texts)
+        
+        # Fuse embeddings (average)
+        # Note: Both are already normalized by encode_images/encode_texts
+        combined_embeds = (img_embeds + txt_embeds) / 2.0
+        
+        # Re-normalize
+        norms = np.linalg.norm(combined_embeds, axis=1, keepdims=True)
+        combined_embeds = combined_embeds / norms
+        
+        return combined_embeds
 
     @torch.no_grad()
     def compute_similarity(self,
@@ -340,28 +363,26 @@ class MultimodalRetrievalPipeline:
         Returns:
             Similarity matrix (n_queries, n_corpus)
         """
+
         n_queries = query_embeds.shape[0]
         n_corpus = corpus_embeds.shape[0]
 
-        # Convert to torch tensors
-        corpus_tensor = torch.from_numpy(corpus_embeds).to(Config.DEVICE)
+        # Convert to torch tensors with optimized transfers
+        corpus_tensor = torch.from_numpy(corpus_embeds).to(Config.DEVICE, non_blocking=True)
 
         similarities = []
 
         for i in range(0, n_queries, batch_size):
             batch_queries = query_embeds[i:i+batch_size]
-            query_tensor = torch.from_numpy(batch_queries).to(Config.DEVICE)
+            query_tensor = torch.from_numpy(batch_queries).to(Config.DEVICE, non_blocking=True)
 
             # Compute cosine similarity: (batch_size, dim) @ (dim, n_corpus) = (batch_size, n_corpus)
-            dotprod = torch.matmul(query_tensor, corpus_tensor.T)
-            sim = dotprod # * denom
+            sim = torch.matmul(query_tensor, corpus_tensor.T)
             similarities.append(sim.cpu().numpy())
 
             del query_tensor, sim
-            torch.cuda.empty_cache()
 
         del corpus_tensor
-        torch.cuda.empty_cache()
 
         return np.vstack(similarities)
 
@@ -384,45 +405,14 @@ class MultimodalRetrievalPipeline:
 
         top_k = 10
 
-        # Encode queries
-        # if query_type == 'text':
-        # elif query_type == 'image':
-        #qry_emb_text = self.encode_texts(query_text)
+        # Encode query images
         qry_emb_img = self.encode_images(query_img)
 
-        #print("emb text shape", qry_emb_text.shape)
-        #print("emb img shape", qry_emb_img.shape)
-
         # Encode corpus
-        # if corpus_type == 'text':
         corpus_embeds = self.encode_texts(corpus_text)
-        #elif corpus_type == 'image':
-        #    corpus_embeds = self.encode_images(corpus)
-        #else:
-        #    raise ValueError(f"Unknown corpus_type: {corpus_type}")
         similarities=  self.compute_similarity(qry_emb_img, corpus_embeds)
-        # Compute similarities
-        #similarities = self.compute_similarity(qry_emb_text, corpus_embeds)
-
-        # Get top-k results
-        top_k = min(top_k, similarities.shape[1])
-        top_indices = np.argsort(-similarities, axis=1)[:, :top_k]
-        top_scores = np.take_along_axis(similarities, top_indices, axis=1)
-
-        results = {
-            'indices': top_indices,
-            'scores': top_scores,
-        }
-
-        return results
-
-
-    def retrieve_t2i(query_text, corpus_img):
         
-        query_embed = self.encode_texts(query_text)
-        corpus_embeds = self.encode_images(corpus_imgs)
-        similarities=  self.compute_similarity(qry_embeds, corpus_embeds)
-
+        # Compute similarities
         # Get top-k results
         top_k = min(top_k, similarities.shape[1])
         top_indices = np.argsort(-similarities, axis=1)[:, :top_k]
@@ -436,6 +426,53 @@ class MultimodalRetrievalPipeline:
         return results
 
 
+    def retrieve_t2i(self, query_text, corpus_img_embeds) -> Dict:
+        top_k = 10
+        query_txt_embeds = self.encode_texts(query_text)
+        similarities=  self.compute_similarity(query_txt_embeds, corpus_img_embeds)
+
+        # Get top-k results
+        top_k = min(top_k, similarities.shape[1])
+        top_indices = np.argsort(-similarities, axis=1)[:, :top_k]
+        top_scores = np.take_along_axis(similarities, top_indices, axis=1)
+
+        results = {
+            'indices': top_indices,
+            'scores': top_scores,
+        }
+
+        return results
+
+    def retrieve_multimodal(self, 
+                          query_images: List[Image.Image], 
+                          query_texts: List[str],
+                          corpus_images: List[Image.Image],
+                          corpus_texts: List[str]) -> Dict:
+        """
+        Perform retrieval using multimodal queries and corpus.
+        """
+        top_k = 10
+        
+        # Encode queries
+        query_embeds = self.encode_multimodal(query_images, query_texts)
+        
+        # Encode corpus
+        corpus_embeds = self.encode_multimodal(corpus_images, corpus_texts)
+        
+        # Compute similarities
+        similarities = self.compute_similarity(query_embeds, corpus_embeds)
+        
+        # Get top-k results
+        top_k = min(top_k, similarities.shape[1])
+        top_indices = np.argsort(-similarities, axis=1)[:, :top_k]
+        top_scores = np.take_along_axis(similarities, top_indices, axis=1)
+        
+        results = {
+            'indices': top_indices,
+            'scores': top_scores,
+        }
+        
+        return results
 
     def cleanup(self):
         """Clean up GPU memory."""
@@ -443,4 +480,3 @@ class MultimodalRetrievalPipeline:
         torch.cuda.empty_cache()
         gc.collect()
         print("Pipeline cleaned up.")
-

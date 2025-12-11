@@ -5,3 +5,14 @@
 */__pycache__/
 *.pyc
 *.swap
+*.swp
+*.sw*
+/venv
+logs
+.*
+*.png
+worklink 
+UniME/
+VLM2Vec/
+
+misc/
