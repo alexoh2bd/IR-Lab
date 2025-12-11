@@ -1,5 +1,7 @@
 from huggingface_hub import hf_hub_download
 from datasets import load_dataset
+from pipe import MultimodalRetrievalPipeline
+
 import zipfile, os
 from PIL import Image, ImageFilter, ImageEnhance
 import requests
@@ -15,9 +17,9 @@ from tqdm.auto import tqdm
 import pandas as pd
 from sklearn.metrics import ndcg_score
 import cv2
-from pipe import MultimodalRetrievalPipeline
 from datetime import datetime
 from transformers import CLIPProcessor, CLIPModel, AutoModelForCausalLM
+# from attacks import pgd_attack
 
 # model = AutoModelForCausalLM.from_pretrained("TIGER-Lab/VLM2Vec-Full", trust_remote_code=True, torch_dtype="auto")
 torch.cuda.is_available()
@@ -60,7 +62,74 @@ def setup_ndcg_logger(log_file: str = None):
     logger.info(f"Logging to: {log_file}")
     return logger
 
-
+def pgd_attack_clip(image, pipeline, epsilon=0.03, alpha=0.005, steps=10, target_text=None):
+    """
+    PGD attack on CLIP to reduce image-text similarity (maximize similarity to generic text).
+    """
+    if target_text is None:
+        target_text = "A photo of an object"
+        
+    # Resize to 224x224 first to match model input size
+    img_resized = image.resize((224, 224), Image.BILINEAR)
+    
+    # Convert to [0, 1] tensor
+    img_np = np.array(img_resized.convert("RGB")).astype(np.float32) / 255.0
+    x0 = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(pipeline.model.device)
+    
+    x_adv = x0.clone().detach()
+    # Random initialization
+    x_adv = x_adv + torch.empty_like(x_adv).uniform_(-epsilon, epsilon)
+    x_adv = torch.clamp(x_adv, 0, 1)
+    
+    # Normalization constants
+    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to(pipeline.model.device)
+    std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to(pipeline.model.device)
+    
+    # Prepare text embeddings
+    text_inputs = pipeline.processor(text=[target_text], return_tensors="pt", padding=True)
+    text_inputs = {k: v.to(pipeline.model.device) for k, v in text_inputs.items()}
+    
+    with torch.no_grad():
+        text_embeds = pipeline.model.get_text_features(**text_inputs)
+        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+        
+    for _ in range(steps):
+        x_adv.requires_grad = True
+        
+        # Normalize
+        x_norm = (x_adv - mean) / std
+        
+        # Forward pass
+        image_embeds = pipeline.model.get_image_features(pixel_values=x_norm)
+        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+        
+        # Loss: maximize similarity to generic text (to reduce relevance to original)
+        similarity = F.cosine_similarity(image_embeds, text_embeds)
+        loss = similarity.mean()
+        
+        # Backward
+        pipeline.model.zero_grad()
+        loss.backward()
+        
+        # Update
+        with torch.no_grad():
+            grad = x_adv.grad.sign()
+            x_adv = x_adv + alpha * grad
+            
+            # Projection
+            x_adv = torch.max(torch.min(x_adv, x0 + epsilon), x0 - epsilon)
+            x_adv = torch.clamp(x_adv, 0, 1)
+            
+    # Convert back to PIL
+    perturbed_np = x_adv.squeeze(0).detach().cpu().numpy()
+    perturbed_np = (perturbed_np.transpose(1, 2, 0) * 255).astype(np.uint8)
+    perturbed_image = Image.fromarray(perturbed_np)
+    
+    # Resize back to original size
+    if perturbed_image.size != image.size:
+        perturbed_image = perturbed_image.resize(image.size, Image.LANCZOS)
+        
+    return perturbed_image
 # This attack is based on the FGSM attack on CLIP to reduce image-text similarity.
 def fgsm_attack_clip(image, pipeline, epsilon=0.03, target_text=None):
     """
@@ -160,6 +229,9 @@ def perturb(img, ptype, pipeline=None):
         assert pipeline is not None, "Pipeline required for FGSM attack"
         return fgsm_attack_clip(img, pipeline, epsilon=0.03)
     # control
+    elif ptype == "pgd":
+        assert pipeline is not None, "pipeline required for pgd"
+        return pgd_attack_clip(img, pipeline, epsilon=0.03)
     else:
         return img
 
@@ -289,11 +361,12 @@ def deliverthegoods(datasets, perturbations, model_name):
     pipeline = MultimodalRetrievalPipeline(model_name)
     ndcg_scores = {}
     avg_ndcg_scores = {}
-    base_img_url = '/work/aho13/work/aho13/'
+    base_img_url = '/work/aho13/MMEB-eval/'
     k=10
 
     i2tds = set(["MSCOCO_i2t","VisualNews_i2t"])
     t2ids = set(["MSCOCO_t2i","VisualNews_t2i", "VisDial", "Wiki-SS-NQ"])
+    vqads = set(["A-OKVQA","ChartQA", "DocVQA","InfographicsVQA", "Visual7W", "ScienceQA", "VizWiz"])
 
 
     with torch.autocast(device_type='cuda', dtype=torch.float16):
@@ -311,7 +384,7 @@ def deliverthegoods(datasets, perturbations, model_name):
                 scores=[]
                 perfect_count = 0
                 retrieved_count = 0
-                if ds_name in i2tds:
+                if ds_name in i2tds or ds_name in vqads:
                     scores, perfect_count, retrieved_count = i2t(list(ds['test']), pipeline, base_img_url, p)
                 
                 elif ds_name in t2ids:
@@ -336,14 +409,15 @@ def deliverthegoods(datasets, perturbations, model_name):
 def main():
 
     # Visual News_i2t dataset and pipeline
-    # datasets= ["VisualNews_i2t"]
+    # datasets= ["t2i"]
     # datasets= [ "Wiki-SS-NQ"]
-    datasets=["VisualNews_t2i","MSCOCO_t2i","VisDial","WIKI-SS-NQ"]
+    # datasets=["VisualNews_t2i","MSCOCO_t2i","VisDial","WIKI-SS-NQ"]
+    datasets = ["A-OKVQA","ChartQA", "DocVQA","InfographicsVQA", "Visual7W", "ScienceQA", "VizWiz"]
     # perturbations = ["flip", "gauss1","bright","grayscale"]
     # perturbations = ['gauss1','compress', 'flip']
-    perturbations = ["ctrl",'fgsm']
-    model_name = "openai/clip-vit-base-patch32"
-    ndcg_scores = deliverthegoods(datasets, perturbations, model_name)
+    perturbations = ['ctrl', 'pgd']
+    # model_name = "openai/clip-vit-base-patch32"
+    ndcg_scores = deliverthegoods(datasets, perturbations,"openai/clip-vit-large-patch14")
 
 
 if __name__ == "__main__":

@@ -20,7 +20,8 @@ from transformers import AutoModel, CLIPProcessor, CLIPModel, AutoModelForCausal
 torch.cuda.is_available()
 class Config:
     """Configuration for the retrieval pipeline."""
-    MODEL_NAME = "openai/clip-vit-base-patch32" #"TIGER-Lab/VLM2Vec-Full" #
+    # MODEL_NAME = "openai/clip-vit-base-patch32" #"TIGER-Lab/VLM2Vec-Full" #
+    MODEL_NAME="openai/clip-vit-large-patch14"
     BATCH_SIZE = 256  # Adjust based on your GPU memory
     IMAGE_BATCH_SIZE = 64  # Smaller batch for images (more memory intensive)
     TEXT_BATCH_SIZE = 256  # Larger batch for text-only processing
@@ -146,19 +147,19 @@ class MultimodalRetrievalPipeline:
         print(f"Loading model on {Config.DEVICE}...")
 
 
-        if model_name == "openai/clip-vit-base-patch32":
+        # if model_name == "openai/clip-vit-base-patch32":
             # Load model with memory optimizations
-            self.model = CLIPModel.from_pretrained(
-                model_name,
-                dtype=Config.DTYPE
-            ).to(Config.DEVICE)
-            self.processor = CLIPProcessor.from_pretrained(model_name)
+        self.model = CLIPModel.from_pretrained(
+            model_name,
+            dtype=Config.DTYPE
+        ).to(Config.DEVICE)
+        self.processor = CLIPProcessor.from_pretrained(model_name)
 
-        elif model_name == "jinaai/jina-embeddings-v4":
-            self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True, torch_dtype="auto")
-            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained("TIGER-Lab/VLM2Vec-Full", trust_remote_code=True, dtype="auto")
+        # elif model_name == "jinaai/jina-embeddings-v4":
+        #     self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True, torch_dtype="auto")
+        #     self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        # else:
+        #     self.model = AutoModelForCausalLM.from_pretrained("TIGER-Lab/VLM2Vec-Full", trust_remote_code=True, dtype="auto")
 
         self.model.eval()  # Set to evaluation mode
 
@@ -317,6 +318,35 @@ class MultimodalRetrievalPipeline:
         return np.vstack(embeddings)
 
     @torch.no_grad()
+    def encode_multimodal(self, images: List[Image.Image], texts: List[str]) -> np.ndarray:
+        """
+        Encode image-text pairs into a single fused embedding.
+        
+        Args:
+            images: List of PIL Images
+            texts: List of strings
+            
+        Returns:
+            numpy array of shape (n_pairs, embedding_dim)
+        """
+        if len(images) != len(texts):
+            raise ValueError("Number of images and texts must match")
+            
+        # Encode images and texts separately
+        img_embeds = self.encode_images(images)
+        txt_embeds = self.encode_texts(texts)
+        
+        # Fuse embeddings (average)
+        # Note: Both are already normalized by encode_images/encode_texts
+        combined_embeds = (img_embeds + txt_embeds) / 2.0
+        
+        # Re-normalize
+        norms = np.linalg.norm(combined_embeds, axis=1, keepdims=True)
+        combined_embeds = combined_embeds / norms
+        
+        return combined_embeds
+
+    @torch.no_grad()
     def compute_similarity(self,
                           query_embeds: np.ndarray,
                           corpus_embeds: np.ndarray,
@@ -411,6 +441,37 @@ class MultimodalRetrievalPipeline:
             'scores': top_scores,
         }
 
+        return results
+
+    def retrieve_multimodal(self, 
+                          query_images: List[Image.Image], 
+                          query_texts: List[str],
+                          corpus_images: List[Image.Image],
+                          corpus_texts: List[str]) -> Dict:
+        """
+        Perform retrieval using multimodal queries and corpus.
+        """
+        top_k = 10
+        
+        # Encode queries
+        query_embeds = self.encode_multimodal(query_images, query_texts)
+        
+        # Encode corpus
+        corpus_embeds = self.encode_multimodal(corpus_images, corpus_texts)
+        
+        # Compute similarities
+        similarities = self.compute_similarity(query_embeds, corpus_embeds)
+        
+        # Get top-k results
+        top_k = min(top_k, similarities.shape[1])
+        top_indices = np.argsort(-similarities, axis=1)[:, :top_k]
+        top_scores = np.take_along_axis(similarities, top_indices, axis=1)
+        
+        results = {
+            'indices': top_indices,
+            'scores': top_scores,
+        }
+        
         return results
 
     def cleanup(self):
